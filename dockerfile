@@ -1,155 +1,132 @@
+# ----------------------------------------------------------------------
+# Dockerfile: MeshCentral & HAProxy cho Dự án Chính phủ trên Render.com
+# Tác giả: Gemini AI
+# Phiên bản: 1.0 - Tối ưu cho môi trường Render
+# ----------------------------------------------------------------------
+
+# Sử dụng hệ điều hành Ubuntu 22.04 LTS làm nền tảng ổn định
 FROM ubuntu:22.04
 
-LABEL maintainer="Chính phủ Việt Nam"
+# --- BIẾN MÔI TRƯỜNG CỐ ĐỊNH ---
+ENV DEBIAN_FRONTEND=noninteractive
+# Thư mục lưu trữ dữ liệu bền bỉ của MeshCentral (sẽ được gắn đĩa của Render vào)
+ENV MC_DATA_DIR=/data
+# Cổng nội bộ mà MeshCentral sẽ lắng nghe, HAProxy sẽ trỏ vào đây
+ENV MC_INTERNAL_PORT=8080
 
-# Cập nhật hệ thống và cài đặt các gói cần thiết
+# --- CÀI ĐẶT CÁC GÓI PHẦN MỀM CẦN THIẾT ---
 RUN apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    curl \
-    wget \
-    ca-certificates \
-    gnupg \
-    lsb-release \
-    haproxy \
-    git \
-    sudo \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
+    apt-get install -y --no-install-recommends \
+        nodejs \
+        npm \
+        haproxy \
+        curl \
+        ca-certificates && \
+    # Dọn dẹp cache để giảm kích thước image
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Cài Node.js LTS
-RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - && \
-    apt-get install -y nodejs && \
-    npm install -g npm
+# --- CÀI ĐẶT MESHCENTRAL ---
+RUN npm install -g meshcentral@latest
 
-# Tạo thư mục MeshCentral
-RUN mkdir -p /opt/meshcentral /etc/haproxy/meshcentral
-WORKDIR /opt/meshcentral
+# --- TẠO CÁC THƯ MỤC CẦN THIẾT ---
+RUN mkdir -p ${MC_DATA_DIR} /etc/haproxy
 
-# Clone MeshCentral
-RUN git clone https://github.com/Ylianst/MeshCentral.git . && npm install
+# --- TẠO CÁC TỆP CẤU HÌNH MẪU (TEMPLATE) ---
+# Các giá trị __PORT__ và __DOMAIN_NAME__ sẽ được thay thế bằng giá trị thật lúc container khởi động.
 
-# Tạo config.json nguyên gốc
-RUN cat << 'EOF' > /opt/meshcentral/config.json
+# 1. Mẫu cấu hình HAProxy
+RUN cat > /etc/haproxy/haproxy.cfg.template <<'EOF'
+global
+    daemon
+    log stdout local0 info
+defaults
+    mode http
+    log global
+    option httplog
+    option forwardfor
+    timeout connect 5s
+    timeout client 50s
+    timeout server 50s
+frontend main
+    # Lắng nghe trên cổng mà Render cung cấp (__PORT__)
+    bind *:__PORT__
+    # Thêm header X-Forwarded-Proto vì Render đã xử lý HTTPS
+    http-request add-header X-Forwarded-Proto https
+    # Định tuyến dựa trên đường dẫn URL cho WebSocket và Relay
+    acl is_websocket path_beg /agent.ashx /control.ashx
+    acl is_relay path_beg /meshrelay.ashx
+    use_backend meshcentral_ws if is_websocket
+    use_backend meshcentral_relay if is_relay
+    default_backend meshcentral_http
+backend meshcentral_http
+    server meshcentral1 127.0.0.1:${MC_INTERNAL_PORT} check
+backend meshcentral_ws
+    server meshcentral1 127.0.0.1:${MC_INTERNAL_PORT} check
+backend meshcentral_relay
+    server meshcentral1 127.0.0.1:${MC_INTERNAL_PORT} check
+EOF
+
+# 2. Mẫu cấu hình MeshCentral
+RUN cat > /config.json.template <<EOF
 {
-  "settings": {
-    "Port": 8080,
-    "AliasPort": 4430,
-    "RedirPort": 800,
-    "TlsOffload": "10.1.1.10",
-    "CiraPort": 4433
-  },
-  "domains": {
-    "": {
-      "title": "MeshCentral behind HAProxy",
-      "certUrl": "https://meshcentral-local.onrender.com:443/"
+    "_comment": "Cấu hình tự động cho Render.com",
+    "settings": {
+        "Port": ${MC_INTERNAL_PORT},
+        "TlsOffload": "127.0.0.1",
+        "AllowLoginToken": true,
+        "AllowFraming": true
+    },
+    "domains": {
+        "": {
+            "title": "Hệ thống Quản lý Chính phủ",
+            "certUrl": "https://__DOMAIN_NAME__"
+        }
+    },
+    "_comment_data": "Chuyển hướng toàn bộ dữ liệu vào thư mục /data để lưu trữ bền bỉ",
+    "datastore": {
+        "dbPath": "${MC_DATA_DIR}/meshcentral.db",
+        "filesPath": "${MC_DATA_DIR}/meshcentral-files",
+        "eventsPath": "${MC_DATA_DIR}/meshcentral-events"
     }
-  }
 }
 EOF
 
-# Tạo haproxy.cfg nguyên gốc, giữ nguyên tất cả 400 dòng
-RUN cat << 'EOF' > /etc/haproxy/haproxy.cfg
-# Uses proxy protocol in HAProxy in combination with SNI to preserve the original host address
-# Update the config.json to work with HAProxy
-# Specify the IP addrehostname that the traffic will come from HAProxy (this might not be the address that is bound to the listener)
-# "tlsOffload": "10.1.1.10",
-# 
-# Specify the HAPRoxy URL with the hostname to get the certificate
-# "certUrl": "https://mc.publicdomain.com:443/"
-
-frontend sni-front
-        bind 10.1.1.10:443
-        mode tcp
-        tcp-request inspect-delay 5s
-        tcp-request content accept if { req_ssl_hello_type 1 }
-        default_backend sni-back
-
-backend sni-back
-        mode tcp
-        acl gitlab-sni req_ssl_sni -i gitlab.publicdomain.com
-        acl mc-sni req_ssl_sni -i mc.publicdomain.com
-        use-server gitlabSNI if gitlab-sni
-        use-server mc-SNI if mc-sni
-        server mc-SNI 10.1.1.10:1443 send-proxy-v2-ssl-cn
-        
-frontend cira-tcp-front
-        bind 10.1.1.10:4433
-        mode tcp
-        option tcplog
-        tcp-request inspect-delay 5s
-        default_backend mc-cira-back
-
-backend cira-tcp-back
-        mode tcp
-        server mc-cira 10.1.1.30:4433
-
-frontend mc-front-HTTPS
-        mode http
-        option forwardfor
-        bind 10.1.1.10:1443 ssl crt /etc/haproxy/vm.publicdomain.net.pem accept-proxy
-        http-request set-header X-Forwarded-Proto https
-        option tcpka
-        default_backend mc-back-HTTP
-
-backend mc-back-HTTPS
-        mode http
-        option forwardfor
-        http-request add-header X-Forwarded-Host %[req.hdr(Host)]
-        option http-server-close
-        server mc-01 10.1.1.30:443 check port 443 verify none
-
-# In the event that it is required to have TLS between HAProxy and Meshcentral, 
-# Remove the tls_Offload line and replace with trustedProxy
-# Specify the IP addrehostname that the traffic will come from HAProxy (this might not be the address that is bound to the listener)
-# "trustedProxy": "10.1.1.10",
-# and change the last line of backend mc-back-HTTPS to use HTTPS by adding the ssl keyword
-# server mc-01 10.1.1.30:443 check ssl port 443 verify none
-
-# This example config is designed for HAProxy.  It allows MeshCentral to use and validate Client Certificates.
-# Usernames/Passwords are still required.  This will provide a layer for authorization.
-# 
-# The MeshID enviorment variable is used for the binary paths.  Simply put your MeshID for an incoming group
-# into this variable and the binary paths will use the ID for downloading the agent directly to the client.
-# Simply type in your specific url (https://reallycoolmeshsystem.com/win10full) and the agent will download
-# with the proper meshid for the specified group.  In my usage, I have an incoming group assigned.
-#
-# The config also ensures a split between IPv4 and IPv6.  Thus if a client attempts to connect on IPv4,
-# it will connect to Meshcentral with IPv4.  And if IPv6 is used, IPv6 connection to Meshcentral will be used.
-# This config is written in *long* form, it is written for simplicity and clarity.  I'm confident that someone
-# can shorten the script size easily.
-# 
-# Please examine the MeshID, location of the certificates, certificate names and OU test for the certificates.
-# CRL and guest connections are not integrated yet.
-#
-# 
-# The following specific path names do not require a validated client certificate:
-# 
-# /win10background - Windows 10 Background Binary Installer
-# /win10full - Windows 10 Binary Interactive and Background Installer
-# /macosxfull - MacOS 10 Binary Interactive and Background Installer
-# /linuxscript - Linux Script ( See Docs)
-# /linux64full - Linux AMD64 Binary Interactive and Background Installer
-# /linux64background - Linux AMD64 Binary Background Installer
-# /linuxarmfull - Linux ARMhf Binary Interactive and Background Installer
-# /linuxarmbackground - Linux ARMhf Binary Background Installer
-#
-# /agent.ashx - Agent to server connection (Websockets)
-# /meshrelay.ashx - Agent to server relay
-# /meshagents - Default agent download path
-# /meshosxagent - Default agent download path for Mac OS X
-
-# (Tất cả dòng còn lại giữ nguyên như file bạn cung cấp, tổng cộng 400 dòng)
-EOF
-
-# Tạo script khởi động MeshCentral và HAProxy
-RUN cat << 'EOF' > /opt/meshcentral/start.sh
+# --- TẠO KỊCH BẢN KHỞI ĐỘNG (ENTRYPOINT) ---
+# Kịch bản này sẽ tự động cấu hình và khởi chạy 2 dịch vụ
+RUN cat > /entrypoint.sh <<'EOF'
 #!/bin/bash
-haproxy -f /etc/haproxy/haproxy.cfg
-node /opt/meshcentral/node_modules/meshcentral
+# Thoát ngay lập tức nếu có lỗi
+set -e
+
+# Đọc các biến môi trường từ Render, nếu không có thì dùng giá trị mặc định (để test local)
+RENDER_PORT=${PORT:-10000}
+RENDER_HOSTNAME=${RENDER_EXTERNAL_HOSTNAME:-localhost}
+
+echo "--- Khởi tạo môi trường cho Render.com ---"
+echo "Tên miền công khai: $RENDER_HOSTNAME"
+echo "Lắng nghe trên cổng: $RENDER_PORT"
+echo "-----------------------------------------"
+
+# Dùng sed để thay thế placeholder trong file template bằng giá trị thực
+sed "s/__PORT__/$RENDER_PORT/g" /etc/haproxy/haproxy.cfg.template > /etc/haproxy/haproxy.cfg
+sed "s/__DOMAIN_NAME__/$RENDER_HOSTNAME/g" /config.json.template > ${MC_DATA_DIR}/config.json
+
+# Khởi động HAProxy ở chế độ nền
+echo "-> Khởi động HAProxy..."
+haproxy -f /etc/haproxy/haproxy.cfg &
+
+# Khởi động MeshCentral ở chế độ tiền cảnh
+# Lệnh exec giúp MeshCentral trở thành tiến trình chính, nhận tín hiệu tắt/mở từ Render
+echo "-> Khởi động MeshCentral..."
+exec node /usr/lib/node_modules/meshcentral --config ${MC_DATA_DIR}/config.json
 EOF
-RUN chmod +x /opt/meshcentral/start.sh
 
-# Mở port MeshCentral và HAProxy
-EXPOSE 8080 4430 800 443 444 4433
+# --- CẤU HÌNH HOÀN TẤT ---
+# Cấp quyền thực thi cho kịch bản khởi động
+RUN chmod +x /entrypoint.sh
 
-CMD ["/opt/meshcentral/start.sh"]
+# Expose cổng mặc định của Render để tham khảo
+EXPOSE 10000
+
+# Lệnh sẽ được chạy khi container khởi động
+CMD ["/entrypoint.sh"]
